@@ -113,8 +113,31 @@ struct IptablesBlocker {
 
 impl IptablesBlocker {
     fn new() -> Self {
-        Self {
+        let mut blocker = Self {
             blocked_ips: Vec::new(),
+        };
+        // Clean up any leftover rules from previous crashed sessions
+        blocker.cleanup_stale_rules();
+        blocker
+    }
+
+    /// Remove any stale iptables rules for our blocked domains
+    /// This handles cases where the app crashed or was killed
+    fn cleanup_stale_rules(&mut self) {
+        for domain in BLOCKED_DOMAINS {
+            let ips = Self::resolve_domain_ips(domain);
+            for ip in ips {
+                // Try to delete multiple times in case there are duplicate rules
+                loop {
+                    let output = Command::new("iptables")
+                        .args(["-D", "OUTPUT", "-d", &ip, "-j", "DROP"])
+                        .output();
+                    // Stop when deletion fails (no more rules for this IP)
+                    if output.is_err() || !output.unwrap().status.success() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -162,11 +185,31 @@ impl IptablesBlocker {
                 .output();
         }
     }
+
+    /// Aggressively flush all iptables rules for blocked domains
+    /// This re-resolves domains and removes any matching rules
+    fn flush_all(&mut self) {
+        self.blocked_ips.clear();
+        for domain in BLOCKED_DOMAINS {
+            let ips = Self::resolve_domain_ips(domain);
+            for ip in ips {
+                // Keep deleting until no more rules exist for this IP
+                loop {
+                    let output = Command::new("iptables")
+                        .args(["-D", "OUTPUT", "-d", &ip, "-j", "DROP"])
+                        .output();
+                    if output.is_err() || !output.unwrap().status.success() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for IptablesBlocker {
     fn drop(&mut self) {
-        self.unblock();
+        self.flush_all();
     }
 }
 
@@ -239,7 +282,7 @@ impl App {
             }
         }
         self.progress.save();
-        self.blocker.unblock();
+        self.blocker.flush_all();
     }
 }
 
