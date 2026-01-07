@@ -1,6 +1,7 @@
 <!--toc:start-->
 - [Study Time](#study-time)
 - [Usage](#usage)
+- [Config](#config)
 <!--toc:end-->
 
 ## Study Time
@@ -29,3 +30,16 @@ sudo ./target/release/study-time
 
 ![screenshot](assets/screenshot.png)
 
+## Config
+
+edit `~/.config/study-time/config.toml` to customize blocked domains
+
+```toml
+blocked_domains = [
+    "twitter.com",
+    "youtube.com",
+    "reddit.com",
+]
+```
+
+defaults are created on first run. remove domains you want accessible, add ones you don't.
