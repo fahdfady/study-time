@@ -60,9 +60,16 @@ struct Stats {
 
 impl Progress {
     fn config_path() -> PathBuf {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("study-time");
+        // When running with sudo, use the original user's config dir
+        let config_dir = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            PathBuf::from(format!("/home/{}", sudo_user))
+                .join(".config")
+                .join("study-time")
+        } else {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("study-time")
+        };
         fs::create_dir_all(&config_dir).ok();
         config_dir.join("progress.toml")
     }
