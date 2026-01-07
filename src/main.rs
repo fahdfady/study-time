@@ -27,7 +27,7 @@ use std::{
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-const BLOCKED_DOMAINS: &[&str] = &[
+const DEFAULT_BLOCKED_DOMAINS: &[&str] = &[
     "github.com",
     "twitter.com",
     "x.com",
@@ -39,6 +39,59 @@ const BLOCKED_DOMAINS: &[&str] = &[
     "zulip.com",
     "facebook.com",
 ];
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    #[serde(default = "default_blocked_domains")]
+    blocked_domains: Vec<String>,
+}
+
+fn default_blocked_domains() -> Vec<String> {
+    DEFAULT_BLOCKED_DOMAINS.iter().map(|s| s.to_string()).collect()
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            blocked_domains: default_blocked_domains(),
+        }
+    }
+}
+
+impl Config {
+    fn config_path() -> PathBuf {
+        let config_dir = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            PathBuf::from(format!("/home/{}", sudo_user))
+                .join(".config")
+                .join("study-time")
+        } else {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("study-time")
+        };
+        fs::create_dir_all(&config_dir).ok();
+        config_dir.join("config.toml")
+    }
+
+    fn load() -> Self {
+        let path = Self::config_path();
+        if path.exists() {
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            toml::from_str(&content).unwrap_or_default()
+        } else {
+            let config = Self::default();
+            config.save();
+            config
+        }
+    }
+
+    fn save(&self) {
+        let path = Self::config_path();
+        if let Ok(content) = toml::to_string_pretty(self) {
+            fs::write(path, content).ok();
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Progress Persistence
@@ -116,12 +169,14 @@ impl Progress {
 
 struct IptablesBlocker {
     blocked_ips: Vec<String>,
+    blocked_domains: Vec<String>,
 }
 
 impl IptablesBlocker {
-    fn new() -> Self {
+    fn new(blocked_domains: Vec<String>) -> Self {
         let mut blocker = Self {
             blocked_ips: Vec::new(),
+            blocked_domains,
         };
         // Clean up any leftover rules from previous crashed sessions
         blocker.cleanup_stale_rules();
@@ -131,7 +186,7 @@ impl IptablesBlocker {
     /// Remove any stale iptables rules for our blocked domains
     /// This handles cases where the app crashed or was killed
     fn cleanup_stale_rules(&mut self) {
-        for domain in BLOCKED_DOMAINS {
+        for domain in &self.blocked_domains {
             let ips = Self::resolve_domain_ips(domain);
             for ip in ips {
                 // Try to delete multiple times in case there are duplicate rules
@@ -172,7 +227,7 @@ impl IptablesBlocker {
     }
 
     fn block(&mut self) {
-        for domain in BLOCKED_DOMAINS {
+        for domain in &self.blocked_domains {
             let ips = Self::resolve_domain_ips(domain);
             for ip in ips {
                 if !self.blocked_ips.contains(&ip) {
@@ -197,7 +252,7 @@ impl IptablesBlocker {
     /// This re-resolves domains and removes any matching rules
     fn flush_all(&mut self) {
         self.blocked_ips.clear();
-        for domain in BLOCKED_DOMAINS {
+        for domain in &self.blocked_domains {
             let ips = Self::resolve_domain_ips(domain);
             for ip in ips {
                 // Keep deleting until no more rules exist for this IP
@@ -234,12 +289,13 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let config = Config::load();
         Self {
             studying: false,
             session_start: None,
             session_seconds: 0,
             progress: Progress::load(),
-            blocker: IptablesBlocker::new(),
+            blocker: IptablesBlocker::new(config.blocked_domains),
         }
     }
 
