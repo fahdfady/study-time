@@ -17,11 +17,18 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, stdout},
-    net::ToSocketAddrs,
     path::PathBuf,
-    process::Command,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use std::net::ToSocketAddrs;
+
+#[cfg(not(target_os = "linux"))]
+use std::io::{BufRead, BufReader, Write};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -60,15 +67,7 @@ impl Default for Config {
 
 impl Config {
     fn config_path() -> PathBuf {
-        let config_dir = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            PathBuf::from(format!("/home/{}", sudo_user))
-                .join(".config")
-                .join("study-time")
-        } else {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("study-time")
-        };
+        let config_dir = get_config_dir().join("study-time");
         fs::create_dir_all(&config_dir).ok();
         config_dir.join("config.toml")
     }
@@ -89,7 +88,8 @@ impl Config {
         let path = Self::config_path();
         if let Ok(content) = toml::to_string_pretty(self) {
             fs::write(&path, content).ok();
-            // Fix ownership when running with sudo
+            // Fix ownership when running with sudo (Unix only)
+            #[cfg(unix)]
             if let Ok(sudo_user) = std::env::var("SUDO_USER") {
                 let _ = Command::new("chown")
                     .args([&sudo_user, path.to_str().unwrap_or_default()])
@@ -97,6 +97,25 @@ impl Config {
             }
         }
     }
+}
+
+/// Get the appropriate config directory, handling sudo on Unix
+fn get_config_dir() -> PathBuf {
+    #[cfg(unix)]
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        // When running with sudo, use the original user's home directory
+        if let Ok(output) = Command::new("getent").args(["passwd", &sudo_user]).output() {
+            if let Ok(line) = String::from_utf8(output.stdout) {
+                // getent passwd format: username:x:uid:gid:gecos:home:shell
+                if let Some(home) = line.split(':').nth(5) {
+                    return PathBuf::from(home).join(".config");
+                }
+            }
+        }
+        // Fallback to /home/user
+        return PathBuf::from(format!("/home/{}", sudo_user)).join(".config");
+    }
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,16 +138,7 @@ struct Stats {
 
 impl Progress {
     fn config_path() -> PathBuf {
-        // When running with sudo, use the original user's config dir
-        let config_dir = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            PathBuf::from(format!("/home/{}", sudo_user))
-                .join(".config")
-                .join("study-time")
-        } else {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("study-time")
-        };
+        let config_dir = get_config_dir().join("study-time");
         fs::create_dir_all(&config_dir).ok();
         config_dir.join("progress.toml")
     }
@@ -170,37 +180,44 @@ impl Progress {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Iptables Blocking
+// Website Blocking (Cross-platform)
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct IptablesBlocker {
+trait Blocker {
+    fn block(&mut self);
+    fn unblock(&mut self);
+    fn flush_all(&mut self);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Linux: iptables-based blocking
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+struct PlatformBlocker {
     blocked_ips: Vec<String>,
     blocked_domains: Vec<String>,
 }
 
-impl IptablesBlocker {
+#[cfg(target_os = "linux")]
+impl PlatformBlocker {
     fn new(blocked_domains: Vec<String>) -> Self {
         let mut blocker = Self {
             blocked_ips: Vec::new(),
             blocked_domains,
         };
-        // Clean up any leftover rules from previous crashed sessions
         blocker.cleanup_stale_rules();
         blocker
     }
 
-    /// Remove any stale iptables rules for our blocked domains
-    /// This handles cases where the app crashed or was killed
     fn cleanup_stale_rules(&mut self) {
         for domain in &self.blocked_domains {
-            let ips = Self::resolve_domain_ips(domain);
+            let ips = resolve_domain_ips(domain);
             for ip in ips {
-                // Try to delete multiple times in case there are duplicate rules
                 loop {
                     let output = Command::new("iptables")
                         .args(["-D", "OUTPUT", "-d", &ip, "-j", "DROP"])
                         .output();
-                    // Stop when deletion fails (no more rules for this IP)
                     if output.is_err() || !output.unwrap().status.success() {
                         break;
                     }
@@ -208,33 +225,13 @@ impl IptablesBlocker {
             }
         }
     }
+}
 
-    fn resolve_domain_ips(domain: &str) -> Vec<String> {
-        let mut ips = Vec::new();
-
-        // Try to resolve the domain
-        if let Ok(addrs) = format!("{}:443", domain).to_socket_addrs() {
-            for addr in addrs {
-                ips.push(addr.ip().to_string());
-            }
-        }
-
-        // Also try with www prefix
-        if let Ok(addrs) = format!("www.{}:443", domain).to_socket_addrs() {
-            for addr in addrs {
-                let ip = addr.ip().to_string();
-                if !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
-        }
-
-        ips
-    }
-
+#[cfg(target_os = "linux")]
+impl Blocker for PlatformBlocker {
     fn block(&mut self) {
         for domain in &self.blocked_domains {
-            let ips = Self::resolve_domain_ips(domain);
+            let ips = resolve_domain_ips(domain);
             for ip in ips {
                 if !self.blocked_ips.contains(&ip) {
                     let _ = Command::new("iptables")
@@ -254,14 +251,11 @@ impl IptablesBlocker {
         }
     }
 
-    /// Aggressively flush all iptables rules for blocked domains
-    /// This re-resolves domains and removes any matching rules
     fn flush_all(&mut self) {
         self.blocked_ips.clear();
         for domain in &self.blocked_domains {
-            let ips = Self::resolve_domain_ips(domain);
+            let ips = resolve_domain_ips(domain);
             for ip in ips {
-                // Keep deleting until no more rules exist for this IP
                 loop {
                     let output = Command::new("iptables")
                         .args(["-D", "OUTPUT", "-d", &ip, "-j", "DROP"])
@@ -275,10 +269,182 @@ impl IptablesBlocker {
     }
 }
 
-impl Drop for IptablesBlocker {
+#[cfg(target_os = "linux")]
+impl Drop for PlatformBlocker {
     fn drop(&mut self) {
         self.flush_all();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Windows & macOS: hosts file-based blocking
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(not(target_os = "linux"))]
+struct PlatformBlocker {
+    blocked_domains: Vec<String>,
+    is_blocking: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PlatformBlocker {
+    fn new(blocked_domains: Vec<String>) -> Self {
+        let mut blocker = Self {
+            blocked_domains,
+            is_blocking: false,
+        };
+        // Clean up any stale entries from previous crashed sessions
+        blocker.flush_all();
+        blocker
+    }
+
+    fn hosts_path() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/etc/hosts")
+        }
+    }
+
+    fn marker_start() -> &'static str {
+        "# >>> STUDY-TIME BLOCK START <<<"
+    }
+
+    fn marker_end() -> &'static str {
+        "# >>> STUDY-TIME BLOCK END <<<"
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Blocker for PlatformBlocker {
+    fn block(&mut self) {
+        if self.is_blocking {
+            return;
+        }
+
+        let hosts_path = Self::hosts_path();
+        let content = fs::read_to_string(&hosts_path).unwrap_or_default();
+
+        // Build block entries
+        let mut block_entries = String::new();
+        block_entries.push_str(Self::marker_start());
+        block_entries.push('\n');
+        for domain in &self.blocked_domains {
+            block_entries.push_str(&format!("127.0.0.1 {}\n", domain));
+            block_entries.push_str(&format!("127.0.0.1 www.{}\n", domain));
+            block_entries.push_str(&format!("::1 {}\n", domain));
+            block_entries.push_str(&format!("::1 www.{}\n", domain));
+        }
+        block_entries.push_str(Self::marker_end());
+        block_entries.push('\n');
+
+        // Append to hosts file
+        let new_content = format!("{}\n{}", content.trim_end(), block_entries);
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&hosts_path)
+        {
+            let _ = file.write_all(new_content.as_bytes());
+            self.is_blocking = true;
+
+            // Flush DNS cache
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("ipconfig")
+                    .args(["/flushdns"])
+                    .output();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("dscacheutil")
+                    .args(["-flushcache"])
+                    .output();
+                let _ = std::process::Command::new("killall")
+                    .args(["-HUP", "mDNSResponder"])
+                    .output();
+            }
+        }
+    }
+
+    fn unblock(&mut self) {
+        self.flush_all();
+        self.is_blocking = false;
+    }
+
+    fn flush_all(&mut self) {
+        let hosts_path = Self::hosts_path();
+        let content = match fs::read_to_string(&hosts_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Remove our block section
+        let mut new_lines = Vec::new();
+        let mut in_block = false;
+
+        let file = std::io::Cursor::new(content);
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if line.contains(Self::marker_start()) {
+                in_block = true;
+                continue;
+            }
+            if line.contains(Self::marker_end()) {
+                in_block = false;
+                continue;
+            }
+            if !in_block {
+                new_lines.push(line);
+            }
+        }
+
+        let new_content = new_lines.join("\n");
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&hosts_path)
+        {
+            let _ = file.write_all(new_content.as_bytes());
+        }
+
+        self.is_blocking = false;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for PlatformBlocker {
+    fn drop(&mut self) {
+        self.flush_all();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn resolve_domain_ips(domain: &str) -> Vec<String> {
+    let mut ips = Vec::new();
+
+    if let Ok(addrs) = format!("{}:443", domain).to_socket_addrs() {
+        for addr in addrs {
+            ips.push(addr.ip().to_string());
+        }
+    }
+
+    if let Ok(addrs) = format!("www.{}:443", domain).to_socket_addrs() {
+        for addr in addrs {
+            let ip = addr.ip().to_string();
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+    }
+
+    ips
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +456,7 @@ struct App {
     session_start: Option<Instant>,
     session_seconds: u64,
     progress: Progress,
-    blocker: IptablesBlocker,
+    blocker: PlatformBlocker,
 }
 
 impl App {
@@ -301,7 +467,7 @@ impl App {
             session_start: None,
             session_seconds: 0,
             progress: Progress::load(),
-            blocker: IptablesBlocker::new(config.blocked_domains),
+            blocker: PlatformBlocker::new(config.blocked_domains),
         }
     }
 
@@ -478,9 +644,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
-    // Check for root privileges
-    if !nix_check_root() {
-        eprintln!("⚠️  This app requires root privileges to block websites.");
+    // Check for admin/root privileges
+    if !check_admin() {
+        eprintln!("⚠️  This app requires elevated privileges to block websites.");
+        #[cfg(windows)]
+        eprintln!("   Please run as Administrator.");
+        #[cfg(unix)]
         eprintln!("   Please run with: sudo ./study-time");
         std::process::exit(1);
     }
@@ -538,6 +707,16 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn nix_check_root() -> bool {
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform-specific admin check
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn check_admin() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(windows)]
+fn check_admin() -> bool {
+    is_elevated::is_elevated()
 }
