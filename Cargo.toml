@@ -11,4 +11,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+is_elevated = "0.1"
